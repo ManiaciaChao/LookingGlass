@@ -125,6 +125,14 @@ static void testTwoFingerAndButton(void)
   assert(capture.frames[0].active_count == 2);
   assert(capture.frames[0].contacts[0].contact_id == 0);
   assert(capture.frames[0].contacts[1].contact_id == 1);
+
+  handle(&touchpad, &capture, EV_KEY, BTN_LEFT, 0);
+  handle(&touchpad, &capture, EV_SYN, SYN_REPORT, 0);
+
+  assert(capture.frameCount == 2);
+  assert(capture.frames[1].buttons_state == 0);
+  assert(capture.frames[1].contact_count == 0);
+  assert(capture.frames[1].active_count == 2);
 }
 
 static void testSynDroppedAndOverflow(void)

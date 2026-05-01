@@ -92,6 +92,7 @@ static void touchpadHandleReport(
   {
     for(int i = 0; i < PS_TOUCHPAD_MAX_CONTACTS; ++i)
       touchpad->slots[i].dirty = false;
+    touchpad->buttonsDirty = false;
     return;
   }
 
@@ -131,7 +132,7 @@ static void touchpadHandleReport(
     };
   }
 
-  if (count == 0)
+  if (count == 0 && !touchpad->buttonsDirty)
     return;
 
   PSTouchpadFrame frame =
@@ -151,6 +152,7 @@ static void touchpadHandleReport(
       slot->wasActive = slot->active;
       slot->dirty     = false;
     }
+    touchpad->buttonsDirty = false;
   }
 }
 
@@ -228,23 +230,35 @@ void lg_touchpadHandleEvent(
       switch(ev->code)
       {
         case BTN_LEFT:
+        {
+          uint16_t oldButtons = touchpad->buttons;
           if (ev->value)
             touchpad->buttons |= SPICE_MOUSE_BUTTON_MASK_LEFT;
           else
             touchpad->buttons &= ~SPICE_MOUSE_BUTTON_MASK_LEFT;
+          touchpad->buttonsDirty |= touchpad->buttons != oldButtons;
           break;
+        }
         case BTN_RIGHT:
+        {
+          uint16_t oldButtons = touchpad->buttons;
           if (ev->value)
             touchpad->buttons |= SPICE_MOUSE_BUTTON_MASK_RIGHT;
           else
             touchpad->buttons &= ~SPICE_MOUSE_BUTTON_MASK_RIGHT;
+          touchpad->buttonsDirty |= touchpad->buttons != oldButtons;
           break;
+        }
         case BTN_MIDDLE:
+        {
+          uint16_t oldButtons = touchpad->buttons;
           if (ev->value)
             touchpad->buttons |= SPICE_MOUSE_BUTTON_MASK_MIDDLE;
           else
             touchpad->buttons &= ~SPICE_MOUSE_BUTTON_MASK_MIDDLE;
+          touchpad->buttonsDirty |= touchpad->buttons != oldButtons;
           break;
+        }
       }
       break;
 

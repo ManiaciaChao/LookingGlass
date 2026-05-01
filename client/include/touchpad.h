@@ -45,6 +45,7 @@ typedef struct
   bool hasTouchMinor;
 
   uint16_t buttons;
+  bool buttonsDirty;
   bool slotOverflowWarned;
   int currentSlot;
   LGTouchpadSlot slots[PS_TOUCHPAD_MAX_CONTACTS];
