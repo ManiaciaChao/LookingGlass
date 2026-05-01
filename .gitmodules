@@ -3,7 +3,7 @@
 	url = https://github.com/gnif/LGMP.git
 [submodule "repos/PureSpice"]
 	path = repos/PureSpice
-	url = https://github.com/gnif/PureSpice
+	url = https://github.com/ManiaciaChao/PureSpice.git
 [submodule "repos/cimgui"]
 	path = repos/cimgui
 	url = https://github.com/cimgui/cimgui.git
