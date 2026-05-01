@@ -25,31 +25,46 @@
 #include <errno.h>
 #include <linux/input.h>
 #include <string.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
 #include <sys/epoll.h>
+#include <time.h>
 
 #include "app_internal.h"
 #include "core.h"
 #include "main.h"
+#include "touchpad.h"
+#include <purespice.h>
 
 #include "common/debug.h"
 #include "common/option.h"
 #include "common/stringlist.h"
 #include "common/thread.h"
 
+#ifndef SPICE_MOUSE_BUTTON_MASK_LEFT
+#define SPICE_MOUSE_BUTTON_MASK_LEFT   (1 << 0)
+#define SPICE_MOUSE_BUTTON_MASK_MIDDLE (1 << 1)
+#define SPICE_MOUSE_BUTTON_MASK_RIGHT  (1 << 2)
+#endif
+
 typedef struct
 {
   char * path;
   int    fd;
   bool   grabbed;
+  bool   touchpad;
+  LGTouchpad touchpadState;
 }
 EvdevDevice;
 
 struct EvdevState
 {
   char        * deviceList;
+  char        * touchpadList;
   EvdevDevice * devices;
   int           deviceCount;
   bool          exclusive;
+  bool          touchpadExclusive;
   int           keys[KEY_MAX];
 
   void (*dsGrabKeyboard)(void);
@@ -87,6 +102,20 @@ static struct Option options[] =
     .type         = OPTION_TYPE_BOOL,
     .value.x_bool = true
   },
+  {
+    .module         = "input",
+    .name           = "touchpad",
+    .description    = "csv list of evdev touchpad devices to forward as raw multitouch frames",
+    .type           = OPTION_TYPE_STRING,
+    .value.x_string = NULL,
+  },
+  {
+    .module       = "input",
+    .name         = "touchpadExclusive",
+    .description  = "Grab configured touchpad devices in capture mode",
+    .type         = OPTION_TYPE_BOOL,
+    .value.x_bool = true
+  },
   {0}
 };
 
@@ -100,6 +129,9 @@ static bool evdev_grabDevice(EvdevDevice * device)
   if (device->grabbed)
     return true;
 
+  if (device->touchpad && !state.touchpadExclusive)
+    return true;
+
   if (ioctl(device->fd, EVIOCGRAB, (void *)1) < 0)
   {
     DEBUG_ERROR("EVIOCGRAB=1 failed: %s", strerror(errno));
@@ -108,6 +140,26 @@ static bool evdev_grabDevice(EvdevDevice * device)
 
   DEBUG_INFO("Grabbed %s", device->path);
   device->grabbed = true;
+  return true;
+}
+
+static bool evdev_queryTouchpad(EvdevDevice * device)
+{
+  LGTouchpad * touchpad = &device->touchpadState;
+  if (ioctl(device->fd, EVIOCGABS(ABS_MT_POSITION_X), &touchpad->absX) < 0 ||
+      ioctl(device->fd, EVIOCGABS(ABS_MT_POSITION_Y), &touchpad->absY) < 0)
+  {
+    DEBUG_ERROR("%s is missing ABS_MT_POSITION_X/Y", device->path);
+    return false;
+  }
+
+  touchpad->hasPressure =
+    ioctl(device->fd, EVIOCGABS(ABS_MT_PRESSURE), &touchpad->absPressure) == 0;
+  touchpad->hasTouchMajor =
+    ioctl(device->fd, EVIOCGABS(ABS_MT_TOUCH_MAJOR), &touchpad->absTouchMajor) == 0;
+  touchpad->hasTouchMinor =
+    ioctl(device->fd, EVIOCGABS(ABS_MT_TOUCH_MINOR), &touchpad->absTouchMinor) == 0;
+
   return true;
 }
 
@@ -135,6 +187,9 @@ static bool evdev_openDevice(EvdevDevice * device, bool quiet)
 
   DEBUG_INFO("Opened: %s", device->path);
 
+  if (device->touchpad && !evdev_queryTouchpad(device))
+    goto err;
+
   if (state.grabbed)
     evdev_grabDevice(device);
 
@@ -144,6 +199,35 @@ err:
   close(device->fd);
   device->fd = 0;
   return false;
+}
+
+static bool touchpad_sendFrame(const PSTouchpadFrame * frame, void * opaque)
+{
+  (void)opaque;
+  return purespice_touchpadFrame(frame);
+}
+
+static void touchpad_warn(const char * msg, void * opaque)
+{
+  const EvdevDevice * device = (const EvdevDevice *)opaque;
+  DEBUG_WARN("%s: %s", device->path, msg);
+}
+
+static void touchpad_handleEvent(EvdevDevice * device, const struct input_event * ev)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+
+  if (ev->type == EV_SYN && ev->code == SYN_DROPPED)
+    DEBUG_WARN("Touchpad SYN_DROPPED on %s", device->path);
+
+  const bool forward =
+    state.grabbed && !app_isOverlayMode() && g_params.useSpiceInput &&
+    purespice_touchpadRawSupported();
+
+  lg_touchpadHandleEvent(&device->touchpadState, ev, forward,
+      (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL,
+      touchpad_sendFrame, NULL, touchpad_warn, device);
 }
 
 static int evdev_thread(void * opaque)
@@ -207,6 +291,12 @@ static int evdev_thread(void * opaque)
 
       for(int i = 0; i < count; ++i, ++ev)
       {
+        if (device->touchpad)
+        {
+          touchpad_handleEvent(device, ev);
+          continue;
+        }
+
         switch(ev->type)
         {
           case EV_KEY:
@@ -294,30 +384,60 @@ static int evdev_thread(void * opaque)
 bool evdev_start(void)
 {
   const char * deviceList = option_get_string("input", "evdev");
-  if (!deviceList)
+  const char * touchpadList = option_get_string("input", "touchpad");
+  if (!deviceList && !touchpadList)
     return false;
 
-  state.deviceList = strdup(deviceList);
   StringList sl = stringlist_new(false);
+  StringList tl = stringlist_new(false);
 
-  char * token = strtok(state.deviceList, ",");
-  while(token != NULL)
+  if (deviceList)
   {
-    stringlist_push(sl, token);
-    token = strtok(NULL, ",");
+    state.deviceList = strdup(deviceList);
+    char * token = strtok(state.deviceList, ",");
+    while(token != NULL)
+    {
+      stringlist_push(sl, token);
+      token = strtok(NULL, ",");
+    }
   }
 
-  state.deviceCount = stringlist_count(sl);
+  if (touchpadList)
+  {
+    state.touchpadList = strdup(touchpadList);
+    char * token = strtok(state.touchpadList, ",");
+    while(token != NULL)
+    {
+      stringlist_push(tl, token);
+      token = strtok(NULL, ",");
+    }
+  }
+
+  const int keyboardDeviceCount = stringlist_count(sl);
+  const int touchpadDeviceCount = stringlist_count(tl);
+
+  state.deviceCount = keyboardDeviceCount + touchpadDeviceCount;
   state.devices     = calloc(state.deviceCount, sizeof(*state.devices));
-  for(int i = 0; i < state.deviceCount; ++i)
+
+  for(int i = 0; i < keyboardDeviceCount; ++i)
     state.devices[i].path = stringlist_at(sl, i);
+  for(int i = 0; i < touchpadDeviceCount; ++i)
+  {
+    EvdevDevice * device = &state.devices[keyboardDeviceCount + i];
+    device->path = stringlist_at(tl, i);
+    device->touchpad = true;
+    lg_touchpadInit(&device->touchpadState);
+  }
+
   stringlist_free(&sl);
+  stringlist_free(&tl);
 
   // nothing to do if there are no configured devices
   if (state.deviceCount == 0)
     return false;
 
-  state.exclusive = option_get("input", "evdevExclusive");
+  state.exclusive         = option_get("input", "evdevExclusive");
+  state.touchpadExclusive = option_get("input", "touchpadExclusive");
 
   state.epoll = epoll_create1(0);
   if (state.epoll < 0)
@@ -356,6 +476,12 @@ void evdev_stop(void)
     state.deviceList = NULL;
   }
 
+  if (state.touchpadList)
+  {
+    free(state.touchpadList);
+    state.touchpadList = NULL;
+  }
+
   if (state.thread)
   {
     lgJoinThread(state.thread, NULL);
@@ -368,14 +494,19 @@ void evdev_stop(void)
     state.epoll = 0;
   }
 
-  for(EvdevDevice * device = state.devices; device->path; ++device)
+  for(int i = 0; i < state.deviceCount; ++i)
   {
+    EvdevDevice * device = &state.devices[i];
     if (device->fd <= 0)
       continue;
 
     close(device->fd);
     device->fd = 0;
   }
+
+  free(state.devices);
+  state.devices = NULL;
+  state.deviceCount = 0;
 }
 
 void evdev_grabKeyboard(void)
@@ -393,8 +524,9 @@ void evdev_grabKeyboard(void)
 
 //  state.dsGrabKeyboard();
 
-  for(EvdevDevice * device = state.devices; device->path; ++device)
+  for(int i = 0; i < state.deviceCount; ++i)
   {
+    EvdevDevice * device = &state.devices[i];
     if (device->fd > 0)
       evdev_grabDevice(device);
   }
@@ -415,8 +547,9 @@ void evdev_ungrabKeyboard(void)
       return;
     }
 
-  for(EvdevDevice * device = state.devices; device->path; ++device)
+  for(int i = 0; i < state.deviceCount; ++i)
   {
+    EvdevDevice * device = &state.devices[i];
     if (device->fd <= 0 || !device->grabbed)
       continue;
 

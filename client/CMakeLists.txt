@@ -126,6 +126,7 @@ set(SOURCES
   src/overlay_utils.c
   src/render_queue.c
   src/evdev.c
+  src/touchpad.c
 
   src/overlay/splash.c
   src/overlay/alert.c
@@ -167,6 +168,16 @@ target_link_libraries(looking-glass-client
   renderers
   cimgui
 )
+
+enable_testing()
+add_executable(looking-glass-touchpad-test
+  tests/test-touchpad.c
+  src/touchpad.c
+)
+target_link_libraries(looking-glass-touchpad-test
+  purespice
+)
+add_test(NAME looking-glass-touchpad COMMAND looking-glass-touchpad-test)
 
 if (ENABLE_PIPEWIRE OR ENABLE_PULSEAUDIO)
   add_definitions(-D ENABLE_AUDIO)
